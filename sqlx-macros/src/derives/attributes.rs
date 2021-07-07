@@ -3,7 +3,10 @@ use quote::{quote, quote_spanned};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
-use syn::{Attribute, DeriveInput, Field, Lit, Meta, MetaNameValue, NestedMeta, Variant};
+use syn::{
+    Attribute, DeriveInput, Field, Lit, LitStr, Meta, MetaList, MetaNameValue, NestedMeta, Path,
+    Variant,
+};
 
 macro_rules! assert_attribute {
     ($e:expr, $err:expr, $input:expr) => {
@@ -35,7 +38,13 @@ pub struct TypeName {
     pub deprecated_rename: bool,
 }
 
+pub struct DecodeAsWithFunction {
+    pub decode_as_type: Path,
+    pub function: Path,
+    pub fallible: bool,
+}
 impl TypeName {
+
     pub fn get(&self) -> TokenStream {
         let val = &self.val;
         if self.deprecated_rename {
@@ -70,6 +79,7 @@ pub struct SqlxContainerAttributes {
 pub struct SqlxChildAttributes {
     pub rename: Option<String>,
     pub default: bool,
+    pub decode_as: Option<DecodeAsWithFunction>,
 }
 
 pub fn parse_container_attributes(input: &[Attribute]) -> syn::Result<SqlxContainerAttributes> {
@@ -177,12 +187,12 @@ pub fn parse_container_attributes(input: &[Attribute]) -> syn::Result<SqlxContai
 pub fn parse_child_attributes(input: &[Attribute]) -> syn::Result<SqlxChildAttributes> {
     let mut rename = None;
     let mut default = false;
+    let mut decode_as = None;
 
     for attr in input.iter().filter(|a| a.path.is_ident("sqlx")) {
         let meta = attr
             .parse_meta()
             .map_err(|e| syn::Error::new_spanned(attr, e))?;
-
         if let Meta::List(list) = meta {
             for value in list.nested.iter() {
                 match value {
@@ -193,6 +203,38 @@ pub fn parse_child_attributes(input: &[Attribute]) -> syn::Result<SqlxChildAttri
                             ..
                         }) if path.is_ident("rename") => try_set!(rename, val.value(), value),
                         Meta::Path(path) if path.is_ident("default") => default = true,
+                        Meta::List(MetaList { path, nested, .. }) if path.is_ident("decode_as") => {
+                            let mut nested_iter = nested.iter();
+
+                            let decode_as_type = if let Some(decode_as) = nested_iter.next() {
+                                match decode_as {
+                                    NestedMeta::Meta(Meta::Path(p)) => p.clone(),
+                                    da => fail!(da, "not a type"),
+                                }
+                            } else {
+                                fail!(path, "cannot be empty")
+                            };
+                            let function =
+                                if let Some(function) = nested_iter.next() {
+                                    match function {
+                                        NestedMeta::Lit(Lit::Str(lit)) => lit.clone().parse()?,
+                                        NestedMeta::Meta(Meta::Path(p)) => p.clone(),
+                                        da => fail!(da, "expected a string literal or function"),
+                                    }
+                                } else {
+                                    fail!(nested, "expected a function name")
+                            };
+
+                            // TODO: Make nicer.
+                            let fallible = match nested_iter.next() {
+                                None => false,
+                                Some(m) => match m {
+                                    NestedMeta::Meta(_) => todo!("fallable function not yet fully implemented"),
+                                    _ => fail!(path, "unexpected trailing meta, this should not be an error")
+                                }
+                            };
+                            try_set!(decode_as, DecodeAsWithFunction { function, decode_as_type, fallible }, value)
+                        }
                         u => fail!(u, "unexpected attribute"),
                     },
                     u => fail!(u, "unexpected attribute"),
@@ -201,7 +243,11 @@ pub fn parse_child_attributes(input: &[Attribute]) -> syn::Result<SqlxChildAttri
         }
     }
 
-    Ok(SqlxChildAttributes { rename, default })
+    Ok(SqlxChildAttributes {
+        rename,
+        default,
+        decode_as,
+    })
 }
 
 pub fn check_transparent_attributes(

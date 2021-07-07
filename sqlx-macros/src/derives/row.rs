@@ -1,9 +1,8 @@
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
-use syn::{
-    parse_quote, punctuated::Punctuated, token::Comma, Data, DataStruct, DeriveInput, Field,
-    Fields, FieldsNamed, FieldsUnnamed, Lifetime, Stmt,
-};
+use quote::{quote, ToTokens};
+use syn::{Data, DataStruct, DeriveInput, Field, Fields, FieldsNamed, FieldsUnnamed, Lifetime, Stmt, Type, parse_quote, punctuated::Punctuated, spanned::Spanned, token::Comma};
+
+use crate::derives::attributes::SqlxChildAttributes;
 
 use super::{
     attributes::{parse_child_attributes, parse_container_attributes},
@@ -41,7 +40,12 @@ fn expand_derive_from_row_struct(
     fields: &Punctuated<Field, Comma>,
 ) -> syn::Result<TokenStream> {
     let ident = &input.ident;
-
+    let fields: Vec<(_, SqlxChildAttributes)> = fields
+        .iter()
+        .map(|field| -> Result<_, syn::Error> {
+            Ok((field, parse_child_attributes(&field.attrs)?))
+        })
+        .collect::<Result<_, _>>()?;
     let generics = &input.generics;
 
     let (lifetime, provided) = generics
@@ -63,48 +67,83 @@ fn expand_derive_from_row_struct(
 
     predicates.push(parse_quote!(&#lifetime ::std::primitive::str: ::sqlx::ColumnIndex<R>));
 
-    for field in fields {
-        let ty = &field.ty;
-
-        predicates.push(parse_quote!(#ty: ::sqlx::decode::Decode<#lifetime, R::Database>));
-        predicates.push(parse_quote!(#ty: ::sqlx::types::Type<R::Database>));
+    for (field, ref attributes) in &fields {
+        if let Some(decode_as) = &attributes.decode_as {
+            let ty = &decode_as.decode_as_type;
+            predicates.push(parse_quote!(#ty: ::sqlx::decode::Decode<#lifetime, R::Database>));
+            predicates.push(parse_quote!(#ty: ::sqlx::types::Type<R::Database>));
+        } else {
+            let ty = &field.ty;
+            predicates.push(parse_quote!(#ty: ::sqlx::decode::Decode<#lifetime, R::Database>));
+            predicates.push(parse_quote!(#ty: ::sqlx::types::Type<R::Database>));
+        }
     }
 
     let (impl_generics, _, where_clause) = generics.split_for_impl();
 
     let container_attributes = parse_container_attributes(&input.attrs)?;
 
-    let reads = fields.iter().filter_map(|field| -> Option<Stmt> {
-        let id = &field.ident.as_ref()?;
-        let attributes = parse_child_attributes(&field.attrs).unwrap();
-        let id_s = attributes
-            .rename
-            .or_else(|| Some(id.to_string().trim_start_matches("r#").to_owned()))
-            .map(|s| match container_attributes.rename_all {
-                Some(pattern) => rename_all(&s, pattern),
-                None => s,
-            })
-            .unwrap();
+    let reads = fields
+        .iter()
+        .filter_map(|(field, attributes)| -> Option<syn::Result<Stmt>> {
+            let id = &field.ident.as_ref()?;
+            let id_s = attributes
+                .rename
+                .to_owned()
+                .or_else(|| Some(id.to_string().trim_start_matches("r#").to_owned()))
+                .map(|s| match container_attributes.rename_all {
+                    Some(pattern) => rename_all(&s, pattern),
+                    None => s.to_string(),
+                })?;
 
-        let ty = &field.ty;
+            let ty = &field.ty;
 
-        if attributes.default {
-            Some(
-                parse_quote!(let #id: #ty = row.try_get(#id_s).or_else(|e| match e {
+            let try_get: syn::Expr = if let Some(ref decode_as) = attributes.decode_as {
+                let decode_as_type = &decode_as.decode_as_type;
+                let function = &decode_as.function;
+                if decode_as.fallible {
+                    // Assert the return type of the function, does not produce a desirable compiler error
+                    let assert_types = quote::quote_spanned!(function.span()=> 
+                        fn _AssertFunction<E: ::std::error::Error + 'static + Send + Sync>() -> impl ::std::ops::Fn(#decode_as_type) -> ::std::result::Result<#ty,E> {#function}
+                        );
+                    parse_quote!({
+                        #assert_types
+                        let t: ::sqlx::Result<#decode_as_type> = row.try_get(#id_s);
+                        { 
+                            match t {
+                                Ok(t) => #function(t).map(::std::boxed::Box::new).map(::sqlx::Error::Decode),
+                                e => e, 
+                            }}
+                        })
+                } else {
+                    parse_quote!({
+                        let t: ::sqlx::Result<#decode_as_type> = row.try_get(#id_s);
+                            match t {
+                                Ok(t) => ::std::result::Result::Ok(#function(t)),
+                                Err(e) => ::std::result::Result::Err(e), 
+                            }
+                        })
+                } 
+            } else {
+                parse_quote!(row.try_get(#id_s))
+            };
+
+            if attributes.default {
+                Some(Ok(parse_quote!(#try_get.or_else(|e| match e {
                 ::sqlx::Error::ColumnNotFound(_) => {
                     ::std::result::Result::Ok(Default::default())
                 },
                 e => ::std::result::Result::Err(e)
-            })?;),
-            )
-        } else {
-            Some(parse_quote!(
-                let #id: #ty = row.try_get(#id_s)?;
-            ))
-        }
-    });
-
-    let names = fields.iter().map(|field| &field.ident);
+            })?;)))
+            } else {
+                Some(Ok(parse_quote!(
+                    let #id: #ty = #try_get?;
+                )))
+            }
+        });
+    let _ = reads.clone().try_for_each(|s| s.map(|_|()))?;
+    let reads = reads.filter_map(|r| r.ok());
+    let names = fields.iter().map(|(field, _)| &field.ident);
 
     Ok(quote!(
         #[automatically_derived]
